@@ -1,4 +1,4 @@
-import time
+from flask import Flask, request
 import requests
 import sqlite3
 import os
@@ -9,8 +9,11 @@ BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 # === BANCO DE DADOS ===
 DB_PATH = "manutencoes.db"
-OWNER_FILE = "owner_chat_id.txt"  # arquivo onde gravamos o chat_id do dono
+OWNER_FILE = "owner_chat_id.txt"
 
+app = Flask(__name__)
+
+# ------------------- BANCO DE DADOS -------------------
 def criar_banco():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -65,7 +68,7 @@ def editar_manutencao(placa, novo_tipo, nova_descricao, nova_data, novo_km):
     conn.close()
     return False
 
-# --- Owner (para enviar mensagens pro seu chat mesmo sem update ativo) ---
+# ------------------- OWNER -------------------
 def get_owner_chat_id():
     if not os.path.exists(OWNER_FILE):
         return None
@@ -79,9 +82,9 @@ def set_owner_chat_id(chat_id):
     with open(OWNER_FILE, "w") as f:
         f.write(str(chat_id))
 
-# enviar mensagem: se chat_id for None, usa owner salvo
+# ------------------- TELEGRAM -------------------
 def enviar_mensagem(chat_id, texto):
-    target = chat_id if chat_id is not None else get_owner_chat_id()
+    target = chat_id if chat_id else get_owner_chat_id()
     if not target:
         print("⚠️ Nenhum owner configurado; não foi possível enviar a mensagem.")
         return False
@@ -92,122 +95,111 @@ def enviar_mensagem(chat_id, texto):
         print("⚠️ Erro ao enviar mensagem:", e)
         return False
 
-# === Loop de long polling ===
-def main():
+# ------------------- WEBHOOK -------------------
+@app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
     criar_banco()
-    offset = None  # controla a última mensagem lida
+    update = request.json
+    message = update.get("message")
+    if not message:
+        return "ok"
+    
+    chat_id = message["chat"]["id"]
+    text = message.get("text", "")
+    if not text:
+        return "ok"
 
-    print("🤖 Bot iniciado (long polling). Envie /register para salvar seu chat_id como owner.")
+    text_lower = text.lower().strip()
 
-    while True:
+    # Registrar este chat como owner
+    if text_lower.startswith("/register") or text_lower.startswith("/me"):
+        set_owner_chat_id(chat_id)
+        enviar_mensagem(chat_id, "✅ Chat registrado como owner.")
+        return "ok"
+
+    if text_lower.startswith("/id"):
+        enviar_mensagem(chat_id, f"Seu chat_id é: {chat_id}")
+        return "ok"
+
+    # Registrar manutenção
+    if all(x in text_lower for x in ["placa:", "tipo:", "descricao:", "data:", "km:"]):
         try:
-            resp = requests.get(f"{BASE_URL}/getUpdates", params={"offset": offset, "timeout": 20}).json()
-        except Exception as e:
-            print("⚠️ Erro ao conectar no Telegram:", e)
-            time.sleep(5)
-            continue
-        
-        for update in resp.get("result", []):
-            offset = update["update_id"] + 1
-            message = update.get("message", {})
-            chat_id = message.get("chat", {}).get("id")
-            text = message.get("text", "")
-            if not text:
-                continue
+            partes = text_lower.replace(",", "").split()
+            placa = partes[partes.index("placa:")+1]
+            tipo = partes[partes.index("tipo:")+1]
+            descricao_index_start = partes.index("descricao:")+1
+            data_index = partes.index("data:")
+            descricao = " ".join(partes[descricao_index_start:data_index])
+            data = partes[data_index+1]
+            km = int(partes[partes.index("km:")+1])
 
-            text = text.strip()
-            lower_text = text.lower()
+            adicionar_manutencao(placa, tipo, descricao, data, km)
+            msg = f"✅ Manutenção registrada:\n🚗 Placa: {placa.upper()}\n🔧 Tipo: {tipo}\n📝 Descrição: {descricao}\n📅 Data: {data}\n📏 KM: {km}"
+            enviar_mensagem(chat_id, msg)
+            if chat_id != get_owner_chat_id():
+                enviar_mensagem(None, f"📢 Nova manutenção registrada!\n{msg}")
+        except Exception:
+            enviar_mensagem(chat_id, "❌ Erro ao registrar manutenção.\nUse:\nplaca: XXX1234 , tipo: troca_oleo , descricao: filtro trocado , data: 19/09/2025 , km: 12345")
+        return "ok"
 
-            # COMANDO: registrar este chat como owner
-            if lower_text.startswith("/register") or lower_text.startswith("/me"):
-                set_owner_chat_id(chat_id)
-                enviar_mensagem(chat_id, "✅ Chat registrado como owner. Agora o bot enviará notificações para este chat.")
-                continue
+    # Editar última manutenção
+    if text_lower.startswith("/editar"):
+        try:
+            partes = text_lower.split()
+            placa = partes[2]
+            tipo = partes[4]
+            descricao_index_start = partes.index("descricao")+1
+            data_index = partes.index("data")
+            descricao = " ".join(partes[descricao_index_start:data_index])
+            data = partes[data_index+1]
+            km = int(partes[partes.index("km")+1])
+            if editar_manutencao(placa, tipo, descricao, data, km):
+                enviar_mensagem(chat_id, f"✏️ Última manutenção da placa {placa.upper()} atualizada.")
+            else:
+                enviar_mensagem(chat_id, f"🚫 Nenhum registro encontrado para {placa.upper()}")
+        except Exception:
+            enviar_mensagem(chat_id, "❌ Erro ao editar. Use:\n/editar placa XXX1234 tipo troca_oleo descricao filtro trocado data 20/09/2025 km 12345")
+        return "ok"
 
-            if lower_text.startswith("/id"):
-                enviar_mensagem(chat_id, f"Seu chat_id é: {chat_id}")
-                continue
+    # Última manutenção (só digitando a placa)
+    if len(text.replace(" ","")) in [7,8]:  # placas padrão 3L+4N ou 4L+3N
+        registro = ultima_manutencao(text)
+        if registro:
+            enviar_mensagem(chat_id, f"📌 Última manutenção da placa {text.upper()}:\n🔧 {registro[1]}\n📝 {registro[2]}\n📅 {registro[3]}\n📏 KM: {registro[4]}")
+        else:
+            enviar_mensagem(chat_id, f"🚫 Nenhuma manutenção registrada para {text.upper()}")
+        return "ok"
 
-            # Registrar manutenção
-            if "placa:" in lower_text and "tipo:" in lower_text and "descricao:" in lower_text and "data:" in lower_text and "km:" in lower_text:
-                try:
-                    partes = lower_text.replace(",", "").split()
-                    placa = partes[1]
-                    tipo = partes[3]
-                    descricao_index_start = partes.index("descricao")+1
-                    data_index = partes.index("data")
-                    descricao = " ".join(partes[descricao_index_start:data_index])
-                    data = partes[data_index+1]
-                    km = int(partes[partes.index("km")+1])
+    # Histórico
+    if text_lower.startswith("/historico"):
+        try:
+            _, placa = text_lower.split()
+            registros = historico_manutencoes(placa)
+            if registros:
+                resposta = f"📋 Histórico da placa {placa.upper()}:\n"
+                for r in registros:
+                    resposta += f"🔧 {r[0]} - 📝 {r[1]} - 📅 {r[2]} - 📏 KM: {r[3]}\n"
+                enviar_mensagem(chat_id, resposta)
+            else:
+                enviar_mensagem(chat_id, f"🚫 Nenhum registro para {placa.upper()}")
+        except:
+            enviar_mensagem(chat_id, "❌ Use: /historico PLACA")
+        return "ok"
 
-                    adicionar_manutencao(placa, tipo, descricao, data, km)
+    # Ajuda
+    enviar_mensagem(chat_id, "🤖 Comandos:\n"
+                             "• Registrar manutenção:\nplaca: XXX1234 , tipo: troca_oleo , descricao: filtro trocado , data: 19/09/2025 , km: 12345\n"
+                             "• Última manutenção: digite apenas a PLACA\n"
+                             "• Histórico: /historico PLACA\n"
+                             "• Editar última manutenção: /editar placa XXX1234 tipo troca_oleo descricao filtro trocado data 20/09/2025 km 12345\n"
+                             "• Registrar este chat como owner: /register\n"
+                             "• Ver seu chat id: /id")
+    return "ok"
 
-                    msg_registro = f"✅ Manutenção registrada:\n🚗 Placa: {placa.upper()}\n🔧 Tipo: {tipo}\n📝 Descrição: {descricao}\n📅 Data: {data}\n📏 KM: {km}"
-                    enviar_mensagem(chat_id, msg_registro)
-
-                    # 🔔 Notificação automática para o owner
-                    if chat_id != get_owner_chat_id():
-                        enviar_mensagem(None, f"📢 Nova manutenção registrada!\n{msg_registro}")
-
-                except Exception:
-                    enviar_mensagem(chat_id, "❌ Erro ao registrar manutenção.\nUse:\nplaca: XXX1234 , tipo: troca_oleo , descricao: filtro trocado , data: 19/09/2025 , km: 12345")
-                continue
-
-            # Editar última manutenção
-            if lower_text.startswith("/editar"):
-                try:
-                    partes = lower_text.split()
-                    placa = partes[2]
-                    tipo = partes[4]
-                    descricao_index_start = partes.index("descricao")+1
-                    data_index = partes.index("data")
-                    descricao = " ".join(partes[descricao_index_start:data_index])
-                    data = partes[data_index+1]
-                    km = int(partes[partes.index("km")+1])
-
-                    if editar_manutencao(placa, tipo, descricao, data, km):
-                        enviar_mensagem(chat_id, f"✏️ Última manutenção da placa {placa.upper()} foi atualizada:\n🔧 {tipo}\n📝 {descricao}\n📅 {data}\n📏 KM: {km}")
-                    else:
-                        enviar_mensagem(chat_id, f"🚫 Nenhum registro encontrado para {placa.upper()}")
-                except Exception:
-                    enviar_mensagem(chat_id, "❌ Erro ao editar.\nUse:\n/editar placa XXX1234 tipo troca_oleo descricao filtro trocado data 20/09/2025 km 12345")
-                continue
-
-            # Última manutenção (só digitando a placa)
-            if len(text.replace(" ", "")) in [7,8]:  # placas padrão 3 letras+4 números ou 4 letras+3 números
-                registro = ultima_manutencao(text)
-                if registro:
-                    enviar_mensagem(chat_id, f"📌 Última manutenção da placa {text.upper()}:\n🔧 {registro[1]}\n📝 {registro[2]}\n📅 {registro[3]}\n📏 KM: {registro[4]}")
-                else:
-                    enviar_mensagem(chat_id, f"🚫 Nenhuma manutenção registrada para {text.upper()}")
-                continue
-
-            # Histórico
-            if lower_text.startswith("/historico"):
-                try:
-                    _, placa = lower_text.split()
-                    registros = historico_manutencoes(placa)
-                    if registros:
-                        resposta = f"📋 Histórico da placa {placa.upper()}:\n"
-                        for r in registros:
-                            resposta += f"🔧 {r[0]} - 📝 {r[1]} - 📅 {r[2]} - 📏 KM: {r[3]}\n"
-                        enviar_mensagem(chat_id, resposta)
-                    else:
-                        enviar_mensagem(chat_id, f"🚫 Nenhum registro para {placa.upper()}")
-                except:
-                    enviar_mensagem(chat_id, "❌ Use: /historico PLACA")
-                continue
-
-            # Ajuda
-            enviar_mensagem(chat_id, "🤖 Comandos:\n"
-                                     "• Registrar manutenção:\nplaca: XXX1234 , tipo: troca_oleo , descricao: filtro trocado , data: 19/09/2025 , km: 12345\n"
-                                     "• Última manutenção: digite apenas a PLACA\n"
-                                     "• Histórico: /historico PLACA\n"
-                                     "• Editar última manutenção: /editar placa XXX1234 tipo troca_oleo descricao filtro trocado data 20/09/2025 km 12345\n"
-                                     "• Registrar este chat como owner: /register\n"
-                                     "• Ver seu chat id: /id")
-
-        time.sleep(1)
+@app.route("/")
+def index():
+    return "Bot rodando!"
 
 if __name__ == "__main__":
-    main()
+    criar_banco()
+    app.run(host="0.0.0.0", port=8080)
